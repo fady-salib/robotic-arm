@@ -12,7 +12,8 @@
  *
  * Safety:
  *   - Failsafe: no valid packet for 500 ms -> arm eases to its rest pose.
- *   - Slew limiting: servos never jump, they move at a capped speed.
+ *   - Slew limiting: software commands move at a capped speed after startup.
+ *     Actual initial shaft positions are unknown (no encoder feedback).
  *   - Heart rate above 140 bpm halves the speed limit.
  *
  * LED (D13): on while the link is alive, fast blink = Wi-Fi setup failed.
@@ -56,6 +57,8 @@ static uint8_t  rx_buf[sizeof(ArmPacket)];
 static uint8_t  speed_scale_percent = 100;
 static uint32_t last_rx_ms = 0;
 static uint32_t last_ctrl_ms = 0;
+static bool have_rx = false;
+static uint8_t last_seq = 0;
 
 static float clampf(float v, float lo, float hi)
 {
@@ -91,16 +94,24 @@ static void step_servos(float dt_s)
     }
 }
 
-void setup(void)
+static void initialize_servos(void)
 {
-    pinMode(LED_PIN, OUTPUT);
-
     for (uint8_t i = 0; i < NUM_SERVOS; i++) {
         current_deg[i] = REST_POSE[i];
         target_deg[i]  = REST_POSE[i];
+        // Set attach()'s pulse mapping before write(), but prevent a timer ISR
+        // from emitting the library's default pulse between those operations.
+        noInterrupts();
         servos[i].attach(SERVO_PINS[i], 500, 2400);
         servos[i].write((int)REST_POSE[i]);
+        interrupts();
     }
+}
+
+void setup(void)
+{
+    pinMode(LED_PIN, OUTPUT);
+    initialize_servos();
 
     esp_begin(ESP_BAUD);
     while (!(esp_join(WIFI_SSID, WIFI_PASS) && esp_open_udp_rx(ARM_UDP_PORT))) {
@@ -109,22 +120,28 @@ void setup(void)
             delay(80);
         }
     }
+    last_ctrl_ms = millis();
 }
 
 void loop(void)
 {
     // ---- Receive ----
-    if (esp_poll(rx_buf, sizeof(rx_buf))) {
+    while (esp_poll(rx_buf, sizeof(rx_buf))) {
         ArmPacket p;
         memcpy(&p, rx_buf, sizeof(p));
-        if (arm_packet_valid(&p)) {
+        uint32_t received_ms = millis();
+        bool live = have_rx && received_ms - last_rx_ms <= FAILSAFE_MS;
+        if (arm_packet_valid(&p) &&
+            (!live || arm_sequence_newer(p.seq, last_seq))) {
             apply_packet(&p);
-            last_rx_ms = millis();
+            last_rx_ms = received_ms;
+            last_seq = p.seq;
+            have_rx = true;
         }
     }
 
     // ---- Failsafe ----
-    bool link_ok = (last_rx_ms != 0) && (millis() - last_rx_ms <= FAILSAFE_MS);
+    bool link_ok = have_rx && (millis() - last_rx_ms <= FAILSAFE_MS);
     digitalWrite(LED_PIN, link_ok);
     if (!link_ok) {
         for (uint8_t i = 0; i < NUM_SERVOS; i++) target_deg[i] = REST_POSE[i];
@@ -133,7 +150,8 @@ void loop(void)
     // ---- Fixed-rate control step ----
     uint32_t now = millis();
     if (now - last_ctrl_ms >= CONTROL_PERIOD_MS) {
-        step_servos((now - last_ctrl_ms) / 1000.0f);
+        // Do not catch up a long stall with a large, instantaneous command.
+        step_servos(CONTROL_PERIOD_MS / 1000.0f);
         last_ctrl_ms = now;
     }
 }

@@ -2,7 +2,7 @@
  *
  * Detects R-peaks with an adaptive threshold (decaying min/max trackers),
  * a hysteresis band and a refractory period, then averages the last 4
- * beat intervals. Feed it a sample every ~4 ms (250 Hz).
+ * instantaneous BPM estimates. Feed it a sample every ~4 ms (250 Hz).
  */
 #ifndef ARM_HEART_MONITOR_H
 #define ARM_HEART_MONITOR_H

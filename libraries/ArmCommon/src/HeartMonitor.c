@@ -47,6 +47,9 @@ void hr_feed(HeartMonitor *h, uint16_t raw, uint32_t now_ms)
     if (h->have_beat && (now_ms - h->last_beat_ms) > HR_TIMEOUT_MS) {
         h->bpm = 0;
         h->count = 0;
+        h->idx = 0;
+        h->have_beat = 0;
+        h->above = 0;
     }
 
     float span = h->hi - h->lo;

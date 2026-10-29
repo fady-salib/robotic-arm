@@ -63,6 +63,7 @@ void emg_learn_peak(EmgChannel *e)
 
 uint16_t emg_output(const EmgChannel *e)
 {
+    if (e->peak < EMG_MIN_PEAK) return 0; /* no usable calibration */
     float peak = (e->peak < EMG_MIN_PEAK) ? EMG_MIN_PEAK : e->peak;
     float v = e->envelope * CAL_OUT_MAX / peak;
     if (v < 0.0f) v = 0.0f;

@@ -1,7 +1,10 @@
 secrets.h
+!tests/mocks/secrets.h
 .vscode/
 .pio/
 build/
 *.bin
 *.elf
+*.hex
+*.o
 .DS_Store

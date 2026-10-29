@@ -1,4 +1,5 @@
 #include "Esp01.h"
+#include "EspIpd.h"
 
 void esp_begin(uint32_t baud)
 {
@@ -68,6 +69,7 @@ bool esp_open_udp_tx(const char *dest_ip, uint16_t port)
 bool esp_open_udp_rx(uint16_t port)
 {
     if (!esp_simple(F("AT+CIPMUX=1"), 1000)) return false;
+    if (!esp_simple(F("AT+CIPDINFO=0"), 1000)) return false;
     esp_drain();
     Serial.print(F("AT+CIPSTART=0,\"UDP\",\"0.0.0.0\","));
     Serial.print(port);
@@ -77,22 +79,27 @@ bool esp_open_udp_rx(uint16_t port)
     return esp_wait_for("OK", 3000);
 }
 
-/* ---- Non-blocking send: AT+CIPSEND=<n>, wait for '>', then write data ---- */
-static uint8_t  tx_buf[ESP_TX_MAX];
-static uint8_t  tx_len = 0;
-static uint8_t  tx_state = 0;          /* 0 idle, 1 waiting for '>' prompt */
+/* Non-blocking CIPSEND transaction. Do not issue another command until the
+ * module acknowledges SEND OK. On ambiguity, latch a fault rather than sending
+ * an AT command that a module still awaiting payload could transmit as data. */
+static uint8_t tx_buf[ESP_TX_MAX];
+static uint8_t tx_len = 0;
+static uint8_t tx_state = 0; /* idle, prompt, SEND OK, fault */
 static uint32_t tx_start_ms = 0;
+static char tx_reply[16];
+static uint8_t tx_reply_len = 0;
 
-bool esp_tx_busy(void)
-{
-    return tx_state != 0;
-}
+bool esp_tx_busy(void) { return tx_state != 0; }
+bool esp_tx_faulted(void) { return tx_state == 3; }
 
 bool esp_tx_start(const uint8_t *data, uint8_t len)
 {
-    if (tx_state != 0 || len > ESP_TX_MAX) return false;
+    if (tx_state || !data || !len || len > ESP_TX_MAX ||
+        Serial.availableForWrite() < 24) return false;
     memcpy(tx_buf, data, len);
     tx_len = len;
+    tx_reply_len = 0;
+    tx_reply[0] = 0;
     Serial.print(F("AT+CIPSEND="));
     Serial.print(len);
     Serial.print(F("\r\n"));
@@ -104,58 +111,40 @@ bool esp_tx_start(const uint8_t *data, uint8_t len)
 void esp_tx_service(void)
 {
     while (Serial.available()) {
-        char c = (char)Serial.read();    /* replies like "SEND OK" are discarded */
-        if (tx_state == 1 && c == '>') {
-            Serial.write(tx_buf, tx_len);
+        char c = (char)Serial.read();
+        if (tx_state != 1 && tx_state != 2) continue;
+        if (tx_reply_len == sizeof(tx_reply) - 1) {
+            memmove(tx_reply, tx_reply + 1, --tx_reply_len);
+        }
+        tx_reply[tx_reply_len++] = c;
+        tx_reply[tx_reply_len] = 0;
+        if (strstr(tx_reply, "ERROR") || strstr(tx_reply, "FAIL") ||
+            strstr(tx_reply, "busy")) {
+            tx_state = 3;
+        } else if (tx_state == 1 && c == '>') {
+            if (Serial.availableForWrite() < tx_len) {
+                tx_state = 3;
+            } else {
+                Serial.write(tx_buf, tx_len);
+                tx_state = 2;
+                tx_start_ms = millis();
+                tx_reply_len = 0;
+                tx_reply[0] = 0;
+            }
+        } else if (tx_state == 2 && strstr(tx_reply, "SEND OK")) {
             tx_state = 0;
         }
     }
-    if (tx_state == 1 && millis() - tx_start_ms > 300) tx_state = 0;  /* give up */
+    if ((tx_state == 1 || tx_state == 2) &&
+        millis() - tx_start_ms > 1000) tx_state = 3;
 }
 
-/* Incoming data looks like  +IPD,0,16:<16 raw bytes>  */
 bool esp_poll(uint8_t *buf, uint8_t len)
 {
-    static const char HDR[] = "+IPD,";
-    static uint8_t  state = 0;       /* 0 header, 1 meta, 2 payload, 3 skip */
-    static uint8_t  match = 0;
-    static uint16_t plen = 0;
-    static uint16_t got = 0;
-    static bool     past_comma = false;
-
+    static EspIpdParser parser = {};
     while (Serial.available()) {
-        uint8_t c = (uint8_t)Serial.read();
-        switch (state) {
-        case 0:
-            if (c == (uint8_t)HDR[match]) {
-                match++;
-                if (HDR[match] == 0) {
-                    state = 1; match = 0; plen = 0; past_comma = false;
-                }
-            } else {
-                match = (c == '+') ? 1 : 0;
-            }
-            break;
-        case 1:
-            if (c == ',') {
-                past_comma = true;
-                plen = 0;
-            } else if (c == ':') {
-                got = 0;
-                state = (plen == len) ? 2 : (plen > 0 ? 3 : 0);
-            } else if (c >= '0' && c <= '9' && past_comma) {
-                plen = (uint16_t)(plen * 10 + (c - '0'));
-                if (plen > 1500) { state = 0; match = 0; }
-            }
-            break;
-        case 2:
-            buf[got++] = c;
-            if (got >= len) { state = 0; return true; }
-            break;
-        default:
-            if (++got >= plen) state = 0;
-            break;
-        }
+        if (esp_ipd_feed(&parser, (uint8_t)Serial.read(), millis(), buf, len))
+            return true;
     }
     return false;
 }

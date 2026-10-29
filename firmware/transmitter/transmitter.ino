@@ -19,10 +19,21 @@
 #include "Esp01.h"
 #include "secrets.h"
 
+// Current ECG wiring needs a seventh exposed ADC input. Uno use requires
+// explicitly disabling this optional software channel; it is not a pin remap.
+#ifndef ARM_ENABLE_ECG
+#define ARM_ENABLE_ECG 1
+#endif
+#if ARM_ENABLE_ECG && NUM_ANALOG_INPUTS < 7
+#error "ECG on A6 requires an exposed seventh ADC input; use Nano or build with ARM_ENABLE_ECG=0"
+#endif
+
 // ---- Pin map ----
 static const uint8_t FLEX_PINS[ARM_NUM_FINGERS] = {A0, A1, A2, A3, A4}; // thumb..pinky
 static const uint8_t EMG_PIN  = A5;
+#if ARM_ENABLE_ECG
 static const uint8_t ECG_PIN  = A6;   // AD8232 OUTPUT (A6/A7 are analog-only)
+#endif
 static const uint8_t LO_PLUS  = 2;    // AD8232 LO+  (electrode off detect)
 static const uint8_t LO_MINUS = 3;    // AD8232 LO-
 static const uint8_t LED_PIN  = 13;
@@ -34,6 +45,9 @@ static const uint32_t SEND_PERIOD_MS   = 50;    // up to 20 Hz (9600 baud limit)
 static const uint16_t REST_CAL_MS      = 2000;
 static const uint16_t ACTIVE_CAL_MS    = 4000;
 static const uint8_t  ADC_OVERSAMPLE   = 4;
+// The min/max sweep cannot infer wiring polarity. Set true for a channel whose
+// ADC decreases as the finger bends; confirm each channel with servos unpowered.
+static const bool FLEX_INVERT[ARM_NUM_FINGERS] = {false, false, false, false, false};
 
 // ---- State (all static) ----
 static FlexChannel  flex[ARM_NUM_FINGERS];
@@ -74,7 +88,7 @@ static void calibrate(void)
         }
         emg_feed(&emg, read_adc(EMG_PIN));
         emg_learn_peak(&emg);
-        delay(5);
+        delay(SAMPLE_PERIOD_MS);
     }
     digitalWrite(LED_PIN, LOW);
 }
@@ -98,6 +112,8 @@ void setup(void)
     }
 
     calibrate();
+    last_sample_ms = millis();
+    last_send_ms = millis();
 }
 
 void loop(void)
@@ -109,11 +125,13 @@ void loop(void)
     if (now - last_sample_ms >= SAMPLE_PERIOD_MS) {
         last_sample_ms = now;
         emg_feed(&emg, analogRead(EMG_PIN));
+#if ARM_ENABLE_ECG
         if (digitalRead(LO_PLUS) || digitalRead(LO_MINUS)) {
             hr_reset(&heart);                      // electrodes not attached
         } else {
             hr_feed(&heart, analogRead(ECG_PIN), now);
         }
+#endif
     }
 
     // ---- 20 Hz: build and send packet ----
@@ -121,6 +139,10 @@ void loop(void)
         last_send_ms = now;
         for (uint8_t i = 0; i < ARM_NUM_FINGERS; i++) {
             packet.flex[i] = flex_scale(&flex[i], read_adc(FLEX_PINS[i]));
+            if (FLEX_INVERT[i] && flex[i].raw_max >= flex[i].raw_min &&
+                flex[i].raw_max - flex[i].raw_min >= CAL_MIN_SPAN) {
+                packet.flex[i] = CAL_OUT_MAX - packet.flex[i];
+            }
         }
         packet.emg = emg_output(&emg);
         packet.bpm = hr_bpm(&heart);

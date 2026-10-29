@@ -18,7 +18,9 @@ void kin_fk_2link(float l1, float l2, float t1, float t2,
 
 /* Inverse kinematics: fingertip position -> joint angles.
  * Targets outside the reachable ring are pulled onto it.
- * Returns true if the target was reachable as given, false if clamped. */
+ * Returns true if reachable as given, false if projected or invalid.
+ * Invalid/nonpositive lengths or nonfinite inputs produce zero angles.
+ * This solver does not enforce mechanical joint limits. */
 bool kin_ik_2link(float l1, float l2, float x, float y, bool elbow_up,
                   float *t1, float *t2);
 
